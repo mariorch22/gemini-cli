@@ -21,19 +21,11 @@ import { retryWithBackoff } from '../utils/retry.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
 import { ContentGenerator, AuthType } from './contentGenerator.js';
 import { Config } from '../config/config.js';
-import {
-  logApiRequest,
-  logApiResponse,
-  logApiError,
-} from '../telemetry/loggers.js';
-import {
-  ApiErrorEvent,
-  ApiRequestEvent,
-  ApiResponseEvent,
-} from '../telemetry/types.js';
+import { logApiResponse, logApiError } from '../telemetry/loggers.js';
+import { ApiErrorEvent, ApiResponseEvent } from '../telemetry/types.js';
 import { DEFAULT_GEMINI_FLASH_MODEL } from '../config/models.js';
 import { hasCycleInSchema } from '../tools/tools.js';
-import { isStructuredError } from '../utils/quotaErrorDetection.js';
+import { StructuredError } from './turn.js';
 
 /**
  * Returns true if the response is valid, false otherwise.
@@ -139,22 +131,6 @@ export class GeminiChat {
     validateHistory(history);
   }
 
-  private _getRequestTextFromContents(contents: Content[]): string {
-    return JSON.stringify(contents);
-  }
-
-  private async _logApiRequest(
-    contents: Content[],
-    model: string,
-    prompt_id: string,
-  ): Promise<void> {
-    const requestText = this._getRequestTextFromContents(contents);
-    logApiRequest(
-      this.config,
-      new ApiRequestEvent(model, prompt_id, requestText),
-    );
-  }
-
   private async _logApiResponse(
     durationMs: number,
     prompt_id: string,
@@ -242,6 +218,9 @@ export class GeminiChat {
     return null;
   }
 
+  setSystemInstruction(sysInstr: string) {
+    this.generationConfig.systemInstruction = sysInstr;
+  }
   /**
    * Sends a message to the model and returns the response.
    *
@@ -269,8 +248,6 @@ export class GeminiChat {
     await this.sendPromise;
     const userContent = createUserContent(params.message);
     const requestContents = this.getHistory(true).concat(userContent);
-
-    this._logApiRequest(requestContents, this.config.getModel(), prompt_id);
 
     const startTime = Date.now();
     let response: GenerateContentResponse;
@@ -300,16 +277,14 @@ export class GeminiChat {
       };
 
       response = await retryWithBackoff(apiCall, {
-        shouldRetry: (error: Error) => {
-          // Check for likely cyclic schema errors, don't retry those.
-          if (error.message.includes('maximum schema depth exceeded'))
-            return false;
-          // Check error messages for status codes, or specific error names if known
-          if (error && error.message) {
+        shouldRetry: (error: unknown) => {
+          // Check for known error messages and codes.
+          if (error instanceof Error && error.message) {
+            if (isSchemaDepthError(error.message)) return false;
             if (error.message.includes('429')) return true;
             if (error.message.match(/5\d{2}/)) return true;
           }
-          return false;
+          return false; // Don't retry other errors by default
         },
         onPersistent429: async (authType?: string, error?: unknown) =>
           await this.handleFlashFallback(authType, error),
@@ -351,7 +326,6 @@ export class GeminiChat {
     } catch (error) {
       const durationMs = Date.now() - startTime;
       this._logApiError(durationMs, error, prompt_id);
-      await this.maybeIncludeSchemaDepthContext(error);
       this.sendPromise = Promise.resolve();
       throw error;
     }
@@ -386,7 +360,6 @@ export class GeminiChat {
     await this.sendPromise;
     const userContent = createUserContent(params.message);
     const requestContents = this.getHistory(true).concat(userContent);
-    this._logApiRequest(requestContents, this.config.getModel(), prompt_id);
 
     const startTime = Date.now();
 
@@ -419,12 +392,10 @@ export class GeminiChat {
       // the stream. For simple 429/500 errors on initial call, this is fine.
       // If errors occur mid-stream, this setup won't resume the stream; it will restart it.
       const streamResponse = await retryWithBackoff(apiCall, {
-        shouldRetry: (error: Error) => {
-          // Check for likely cyclic schema errors, don't retry those.
-          if (error.message.includes('maximum schema depth exceeded'))
-            return false;
-          // Check error messages for status codes, or specific error names if known
-          if (error && error.message) {
+        shouldRetry: (error: unknown) => {
+          // Check for known error messages and codes.
+          if (error instanceof Error && error.message) {
+            if (isSchemaDepthError(error.message)) return false;
             if (error.message.includes('429')) return true;
             if (error.message.match(/5\d{2}/)) return true;
           }
@@ -453,7 +424,6 @@ export class GeminiChat {
       const durationMs = Date.now() - startTime;
       this._logApiError(durationMs, error, prompt_id);
       this.sendPromise = Promise.resolve();
-      await this.maybeIncludeSchemaDepthContext(error);
       throw error;
     }
   }
@@ -522,6 +492,34 @@ export class GeminiChat {
       .find((chunk) => chunk.usageMetadata);
 
     return lastChunkWithMetadata?.usageMetadata;
+  }
+
+  async maybeIncludeSchemaDepthContext(error: StructuredError): Promise<void> {
+    // Check for potentially problematic cyclic tools with cyclic schemas
+    // and include a recommendation to remove potentially problematic tools.
+    if (
+      isSchemaDepthError(error.message) ||
+      isInvalidArgumentError(error.message)
+    ) {
+      const tools = (await this.config.getToolRegistry()).getAllTools();
+      const cyclicSchemaTools: string[] = [];
+      for (const tool of tools) {
+        if (
+          (tool.schema.parametersJsonSchema &&
+            hasCycleInSchema(tool.schema.parametersJsonSchema)) ||
+          (tool.schema.parameters && hasCycleInSchema(tool.schema.parameters))
+        ) {
+          cyclicSchemaTools.push(tool.displayName);
+        }
+      }
+      if (cyclicSchemaTools.length > 0) {
+        const extraDetails =
+          `\n\nThis error was probably caused by cyclic schema references in one of the following tools, try disabling them with excludeTools:\n\n - ` +
+          cyclicSchemaTools.join(`\n - `) +
+          `\n`;
+        error.message += extraDetails;
+      }
+    }
   }
 
   private async *processStreamResponse(
@@ -685,32 +683,13 @@ export class GeminiChat {
       content.parts[0].thought === true
     );
   }
+}
 
-  private async maybeIncludeSchemaDepthContext(error: unknown): Promise<void> {
-    // Check for potentially problematic cyclic tools with cyclic schemas
-    // and include a recommendation to remove potentially problematic tools.
-    if (
-      isStructuredError(error) &&
-      error.message.includes('maximum schema depth exceeded')
-    ) {
-      const tools = (await this.config.getToolRegistry()).getAllTools();
-      const cyclicSchemaTools: string[] = [];
-      for (const tool of tools) {
-        if (
-          (tool.schema.parametersJsonSchema &&
-            hasCycleInSchema(tool.schema.parametersJsonSchema)) ||
-          (tool.schema.parameters && hasCycleInSchema(tool.schema.parameters))
-        ) {
-          cyclicSchemaTools.push(tool.displayName);
-        }
-      }
-      if (cyclicSchemaTools.length > 0) {
-        const extraDetails =
-          `\n\nThis error was probably caused by cyclic schema references in one of the following tools, try disabling them:\n\n - ` +
-          cyclicSchemaTools.join(`\n - `) +
-          `\n`;
-        error.message += extraDetails;
-      }
-    }
-  }
+/** Visible for Testing */
+export function isSchemaDepthError(errorMessage: string): boolean {
+  return errorMessage.includes('maximum schema depth exceeded');
+}
+
+export function isInvalidArgumentError(errorMessage: string): boolean {
+  return errorMessage.includes('Request contains an invalid argument');
 }

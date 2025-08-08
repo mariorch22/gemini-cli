@@ -9,12 +9,14 @@ import { SchemaValidator } from '../utils/schemaValidator.js';
 import { makeRelative, shortenPath } from '../utils/paths.js';
 import {
   BaseDeclarativeTool,
+  BaseToolInvocation,
   Icon,
   ToolInvocation,
   ToolLocation,
   ToolResult,
 } from './tools.js';
-import { Type } from '@google/genai';
+import { ToolErrorType } from './tool-error.js';
+import { PartUnion, Type } from '@google/genai';
 import {
   processSingleFileContent,
   getSpecificMimeType,
@@ -45,13 +47,16 @@ export interface ReadFileToolParams {
   limit?: number;
 }
 
-class ReadFileToolInvocation
-  implements ToolInvocation<ReadFileToolParams, ToolResult>
-{
+class ReadFileToolInvocation extends BaseToolInvocation<
+  ReadFileToolParams,
+  ToolResult
+> {
   constructor(
     private config: Config,
-    public params: ReadFileToolParams,
-  ) {}
+    params: ReadFileToolParams,
+  ) {
+    super(params);
+  }
 
   getDescription(): string {
     const relativePath = makeRelative(
@@ -61,12 +66,8 @@ class ReadFileToolInvocation
     return shortenPath(relativePath);
   }
 
-  toolLocations(): ToolLocation[] {
+  override toolLocations(): ToolLocation[] {
     return [{ path: this.params.absolute_path, line: this.params.offset }];
-  }
-
-  shouldConfirmExecute(): Promise<false> {
-    return Promise.resolve(false);
   }
 
   async execute(): Promise<ToolResult> {
@@ -78,10 +79,64 @@ class ReadFileToolInvocation
     );
 
     if (result.error) {
+      // Map error messages to ToolErrorType
+      let errorType: ToolErrorType;
+      let llmContent: string;
+
+      // Check error message patterns to determine error type
+      if (
+        result.error.includes('File not found') ||
+        result.error.includes('does not exist') ||
+        result.error.includes('ENOENT')
+      ) {
+        errorType = ToolErrorType.FILE_NOT_FOUND;
+        llmContent =
+          'Could not read file because no file was found at the specified path.';
+      } else if (
+        result.error.includes('is a directory') ||
+        result.error.includes('EISDIR')
+      ) {
+        errorType = ToolErrorType.INVALID_TOOL_PARAMS;
+        llmContent =
+          'Could not read file because the provided path is a directory, not a file.';
+      } else if (
+        result.error.includes('too large') ||
+        result.error.includes('File size exceeds')
+      ) {
+        errorType = ToolErrorType.FILE_TOO_LARGE;
+        llmContent = `Could not read file. ${result.error}`;
+      } else {
+        // Other read errors map to READ_CONTENT_FAILURE
+        errorType = ToolErrorType.READ_CONTENT_FAILURE;
+        llmContent = `Could not read file. ${result.error}`;
+      }
+
       return {
-        llmContent: result.error, // The detailed error for LLM
-        returnDisplay: result.returnDisplay || 'Error reading file', // User-friendly error
+        llmContent,
+        returnDisplay: result.returnDisplay || 'Error reading file',
+        error: {
+          message: result.error,
+          type: errorType,
+        },
       };
+    }
+
+    let llmContent: PartUnion;
+    if (result.isTruncated) {
+      const [start, end] = result.linesShown!;
+      const total = result.originalLineCount!;
+      const nextOffset = this.params.offset
+        ? this.params.offset + end - start + 1
+        : end;
+      llmContent = `
+IMPORTANT: The file content has been truncated.
+Status: Showing lines ${start}-${end} of ${total} total lines.
+Action: To read more of the file, you can use the 'offset' and 'limit' parameters in a subsequent 'read_file' call. For example, to read the next section of the file, use offset: ${nextOffset}.
+
+--- FILE CONTENT (truncated) ---
+${result.llmContent}`;
+    } else {
+      llmContent = result.llmContent || '';
     }
 
     const lines =
@@ -98,7 +153,7 @@ class ReadFileToolInvocation
     );
 
     return {
-      llmContent: result.llmContent || '',
+      llmContent,
       returnDisplay: result.returnDisplay || '',
     };
   }
@@ -117,7 +172,7 @@ export class ReadFileTool extends BaseDeclarativeTool<
     super(
       ReadFileTool.Name,
       'ReadFile',
-      'Reads and returns the content of a specified file from the local filesystem. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.',
+      `Reads and returns the content of a specified file. If the file is large, the content will be truncated. The tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.`,
       Icon.FileSearch,
       {
         properties: {
