@@ -16,10 +16,12 @@ function tryPick(
   label: string,
   value: string | undefined,
   logs: string[],
+  failure: { value: boolean },
 ): SupportedGeminiModel | undefined {
   if (!value) return undefined;
   if (!isSupportedModel(value)) {
     logs.push(`Loading ${label} "${value}" failed, not a valid model name.`);
+    failure.value = true;
     return undefined;
   }
   return value;
@@ -32,13 +34,14 @@ export function selectModel(
   defaultModel: SupportedGeminiModel = DEFAULT_GEMINI_MODEL as SupportedGeminiModel,
 ): { model: SupportedGeminiModel; logs: string[]; hadFailure: boolean } {
   const logs: string[] = [];
+  const failure = { value: false };
   const chosen =
-    tryPick('--model', argv.model, logs) ??
-    tryPick('settings.json', settings.model, logs) ??
-    tryPick('$GEMINI_MODEL', envModel, logs) ??
+    tryPick('--model', argv.model, logs, failure) ??
+    tryPick('settings.json', settings.model, logs, failure) ??
+    tryPick('$GEMINI_MODEL', envModel, logs, failure) ??
     defaultModel;
 
-  const hadFailure = logs.some((l) => l.includes('failed'));
+  const hadFailure = failure.value;
   logs.push(`Using model ${chosen}`);
   return { model: chosen, logs, hadFailure };
 }
