@@ -26,7 +26,7 @@ import { getStartupWarnings } from './utils/startupWarnings.js';
 import { getUserStartupWarnings } from './utils/userStartupWarnings.js';
 import { runNonInteractive } from './nonInteractiveCli.js';
 import { loadExtensions } from './config/extension.js';
-import { selectModel } from './config/modelSelection.js';
+import { verifyModel } from './config/modelSelection.js';
 import { cleanupCheckpoints, registerCleanup } from './utils/cleanup.js';
 import { getCliVersion } from './utils/version.js';
 import {
@@ -153,17 +153,25 @@ export async function main() {
   const argv = await parseArguments();
   const extensions = loadExtensions(workspaceRoot);
 
-  const { model, logs, hadFailure } = selectModel(argv, settings.merged);
-  // Use validated model (CLI > settings > env > default); log only failures.
-  argv.model = model;
-  const showLogLines = hadFailure ? logs : [];
-
   const config = await loadCliConfig(
     settings.merged,
     extensions,
     sessionId,
     argv,
   );
+
+  let showLogLines: string[] = [];
+  if (!argv.allowUnknownModel) {
+    if (argv.model || settings.merged.model || process.env.GEMINI_MODEL) {
+      const { model, logs } = await verifyModel(
+        argv.model,
+        settings.merged.model,
+        process.env.GEMINI_MODEL,
+        config.getGeminiClient(),
+      );
+      showLogLines = [...logs, `Using model ${model}`];
+    }
+  }
 
   dns.setDefaultResultOrder(
     validateDnsResolutionOrder(settings.merged.dnsResolutionOrder),

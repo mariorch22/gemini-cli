@@ -9,8 +9,6 @@ export {
   DEFAULT_GEMINI_MODEL,
   DEFAULT_GEMINI_FLASH_MODEL,
   DEFAULT_GEMINI_EMBEDDING_MODEL,
-  isSupportedModel,
-  type SupportedGeminiModel,
 } from './src/config/models.js';
 export { logIdeConnection } from './src/telemetry/loggers.js';
 export {

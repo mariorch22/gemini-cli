@@ -4,86 +4,248 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { selectModel } from './modelSelection.js';
-import { DEFAULT_GEMINI_MODEL } from '@google/gemini-cli-core';
-import type { CliArgs } from './config.js';
-import type { Settings } from './settings.js';
+import { describe, it, expect, vi } from 'vitest';
+import { verifyModel } from './modelSelection.js';
+import {
+  DEFAULT_GEMINI_MODEL,
+  type GeminiClient,
+} from '@google/gemini-cli-core';
 
-describe('selectModel', () => {
-  const originalEnv = { ...process.env };
+// Mock interfaces for testing
+interface MockError extends Error {
+  status?: number;
+}
 
-  beforeEach(() => {
-    // Clean environment for each test
-    delete process.env.GEMINI_MODEL;
+// Mock client factory for different test scenarios
+const createMockClient = (
+  availableModels: Set<string>,
+  errorType?: string,
+) => ({
+  getContentGenerator: () => ({
+    countTokens: vi.fn().mockImplementation(({ model }: { model: string }) => {
+      if (availableModels.has(model)) {
+        return Promise.resolve();
+      }
+
+      const error: MockError = new Error('Model not available');
+      switch (errorType) {
+        case 'forbidden':
+          error.status = 403;
+          break;
+        case 'unauthorized':
+          error.status = 401;
+          break;
+        case 'rate_limited':
+          error.status = 429;
+          break;
+        case 'server_error':
+          error.status = 500;
+          break;
+        case 'timeout':
+          error.message = 'timeout';
+          break;
+        default:
+          error.status = 404;
+      }
+      return Promise.reject(error);
+    }),
+  }),
+});
+
+describe('verifyModel', () => {
+  describe('model precedence and validation', () => {
+    it('should use CLI model when available', async () => {
+      const client = createMockClient(new Set(['gemini-1.5-pro']));
+      const result = await verifyModel(
+        'gemini-1.5-pro',
+        'gemini-2.5-pro',
+        'gemini-1.5-flash',
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe('gemini-1.5-pro');
+      expect(result.logs).toEqual([]);
+    });
+
+    it('should fallback to settings model when CLI model unavailable', async () => {
+      const client = createMockClient(new Set(['gemini-2.5-pro']));
+      const result = await verifyModel(
+        'invalid-model',
+        'gemini-2.5-pro',
+        'gemini-1.5-flash',
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe('gemini-2.5-pro');
+      expect(result.logs).toEqual([
+        'Model "invalid-model" not found. Check your model name.',
+      ]);
+    });
+
+    it('should fallback to env model when CLI and settings unavailable', async () => {
+      const client = createMockClient(new Set(['gemini-1.5-flash']));
+      const result = await verifyModel(
+        'invalid-cli',
+        'invalid-settings',
+        'gemini-1.5-flash',
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe('gemini-1.5-flash');
+      expect(result.logs).toEqual([
+        'Model "invalid-cli" not found. Check your model name.',
+        'Model "invalid-settings" not found. Check your settings.json.',
+      ]);
+    });
+
+    it('should use default model when all models unavailable', async () => {
+      const client = createMockClient(new Set());
+      const result = await verifyModel(
+        'invalid-cli',
+        'invalid-settings',
+        'invalid-env',
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toEqual([
+        'Model "invalid-cli" not found. Check your model name.',
+        'Model "invalid-settings" not found. Check your settings.json.',
+        'Model "invalid-env" not found. Check your environment variable.',
+        `No model found. Falling back to default model "${DEFAULT_GEMINI_MODEL}"`,
+      ]);
+    });
+
+    it('should use custom default model', async () => {
+      const customDefault = 'custom-default-model';
+      const client = createMockClient(new Set());
+      const result = await verifyModel(
+        undefined,
+        undefined,
+        undefined,
+        client as GeminiClient,
+        customDefault,
+      );
+
+      expect(result.model).toBe(customDefault);
+      expect(result.logs).toEqual([
+        `No model found. Falling back to default model "${customDefault}"`,
+      ]);
+    });
   });
 
-  afterEach(() => {
-    process.env = { ...originalEnv };
+  describe('error handling scenarios', () => {
+    it('should handle 403 forbidden errors', async () => {
+      const client = createMockClient(new Set(), 'forbidden');
+      const result = await verifyModel(
+        'test-model',
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toContain(
+        'Model "test-model" not found. Check your model name.',
+      );
+    });
+
+    it('should handle 401 unauthorized errors', async () => {
+      const client = createMockClient(new Set(), 'unauthorized');
+      const result = await verifyModel(
+        'test-model',
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toContain(
+        'Model "test-model" not found. Check your model name.',
+      );
+    });
+
+    it('should handle timeout errors', async () => {
+      const client = createMockClient(new Set(), 'timeout');
+      const result = await verifyModel(
+        'test-model',
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toContain(
+        'Model "test-model" not found. Check your model name.',
+      );
+    });
+
+    it('should handle server errors', async () => {
+      const client = createMockClient(new Set(), 'server_error');
+      const result = await verifyModel(
+        'test-model',
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
+
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toContain(
+        'Model "test-model" not found. Check your model name.',
+      );
+    });
   });
 
-  it('CLI invalid -> logs failure and uses default', () => {
-    const argv: CliArgs = { model: 'invalid-model-name' } as CliArgs;
-    const settings: Settings = {};
-    const { model, logs, hadFailure } = selectModel(argv, settings);
+  describe('edge cases', () => {
+    it('should handle empty parameters gracefully', async () => {
+      const client = createMockClient(new Set());
+      const result = await verifyModel(
+        undefined,
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
 
-    expect(hadFailure).toBe(true);
-    expect(model).toBe(DEFAULT_GEMINI_MODEL);
-    expect(logs).toEqual(
-      expect.arrayContaining([
-        'Loading --model "invalid-model-name" failed, not a valid model name.',
-        `Using model ${DEFAULT_GEMINI_MODEL}`,
-      ]),
-    );
-  });
+      expect(result.model).toBe(DEFAULT_GEMINI_MODEL);
+      expect(result.logs).toEqual([
+        `No model found. Falling back to default model "${DEFAULT_GEMINI_MODEL}"`,
+      ]);
+    });
 
-  it('settings valid -> picks settings, no failure logs', () => {
-    const argv: CliArgs = {} as CliArgs;
-    const settings: Settings = { model: 'gemini-2.5-pro' };
-    const { model, logs, hadFailure } = selectModel(argv, settings);
+    it('should not call API when no models to verify', async () => {
+      const mockCountTokens = vi.fn();
+      const client = {
+        getContentGenerator: () => ({ countTokens: mockCountTokens }),
+      };
 
-    expect(hadFailure).toBe(false);
-    expect(model).toBe('gemini-2.5-pro');
-    expect(logs).toContain('Using model gemini-2.5-pro');
-    expect(logs.find((l) => l.includes('failed'))).toBeUndefined();
-  });
+      await verifyModel(
+        undefined,
+        undefined,
+        undefined,
+        client as GeminiClient,
+      );
+      expect(mockCountTokens).not.toHaveBeenCalled();
+    });
 
-  it('env invalid (no CLI/settings) -> logs failure and uses default', () => {
-    process.env.GEMINI_MODEL = 'gemini-2.5-flashsss';
-    const argv: CliArgs = {} as CliArgs;
-    const settings: Settings = {};
-    const { model, logs, hadFailure } = selectModel(argv, settings);
+    it('should stop checking after first valid model', async () => {
+      const mockCountTokens = vi
+        .fn()
+        .mockResolvedValueOnce(undefined) // CLI model succeeds
+        .mockRejectedValue({ status: 404 }); // Should not be called
 
-    expect(hadFailure).toBe(true);
-    expect(model).toBe(DEFAULT_GEMINI_MODEL);
-    expect(logs).toEqual(
-      expect.arrayContaining([
-        'Loading $GEMINI_MODEL "gemini-2.5-flashsss" failed, not a valid model name.',
-        `Using model ${DEFAULT_GEMINI_MODEL}`,
-      ]),
-    );
-  });
+      const client = {
+        getContentGenerator: () => ({ countTokens: mockCountTokens }),
+      };
 
-  it('all empty -> uses default, no failure logs', () => {
-    const argv: CliArgs = {} as CliArgs;
-    const settings: Settings = {};
-    const { model, logs, hadFailure } = selectModel(argv, settings);
+      const result = await verifyModel(
+        'valid-cli-model',
+        'settings-model',
+        'env-model',
+        client as GeminiClient,
+      );
 
-    expect(hadFailure).toBe(false);
-    expect(model).toBe(DEFAULT_GEMINI_MODEL);
-    expect(logs).toEqual(
-      expect.arrayContaining([`Using model ${DEFAULT_GEMINI_MODEL}`]),
-    );
-    expect(logs.find((l) => l.includes('failed'))).toBeUndefined();
-  });
-
-  it('precedence: CLI valid wins over settings/env', () => {
-    process.env.GEMINI_MODEL = 'gemini-1.5-flash'; // sollte ignoriert werden
-    const argv: CliArgs = { model: 'gemini-1.5-pro' } as CliArgs;
-    const settings: Settings = { model: 'gemini-2.5-pro' };
-    const { model, hadFailure } = selectModel(argv, settings);
-
-    expect(hadFailure).toBe(false);
-    expect(model).toBe('gemini-1.5-pro');
+      expect(result.model).toBe('valid-cli-model');
+      expect(mockCountTokens).toHaveBeenCalledTimes(1);
+    });
   });
 });

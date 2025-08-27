@@ -72,6 +72,7 @@ export interface CliArgs {
   listExtensions: boolean | undefined;
   proxy: string | undefined;
   includeDirectories: string[] | undefined;
+  allowUnknownModel: boolean | undefined;
 }
 
 export async function parseArguments(): Promise<CliArgs> {
@@ -220,6 +221,12 @@ export async function parseArguments(): Promise<CliArgs> {
           coerce: (dirs: string[]) =>
             // Handle comma-separated values
             dirs.flatMap((dir) => dir.split(',').map((d) => d.trim())),
+        })
+        // Allows to use an unknown model and skip the model verification, e.g. for testing purposes
+        .option('allow-unknown-model', {
+          type: 'boolean',
+          description: 'Allow unknown models',
+          default: false,
         })
         .check((argv) => {
           if (argv.prompt && argv.promptInteractive) {

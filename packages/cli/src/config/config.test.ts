@@ -155,6 +155,18 @@ describe('parseArguments', () => {
     expect(argv.prompt).toBeUndefined();
   });
 
+  it('should set allowUnknownModel to true when --allow-unknown-model is present', async () => {
+    process.argv = ['node', 'script.js', '--allow-unknown-model'];
+    const argv = await parseArguments();
+    expect(argv.allowUnknownModel).toBe(true);
+  });
+
+  it('should default allowUnknownModel to false when flag is absent', async () => {
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    expect(argv.allowUnknownModel).toBe(false);
+  });
+
   it('should allow -i flag as alias for --prompt-interactive', async () => {
     process.argv = ['node', 'script.js', '-i', 'interactive prompt'];
     const argv = await parseArguments();
